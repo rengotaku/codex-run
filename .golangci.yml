@@ -1,0 +1,41 @@
+version: "2"
+
+linters:
+  enable:
+    - gocritic
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        # Config structs are passed by value on purpose for immutability;
+        # they are constructed once per invocation so the copy cost is trivial.
+        - hugeParam
+    errcheck:
+      # fmt.Fprintln/Fprintf to stderr/stdout can't meaningfully fail from user code.
+      # os.File.Close on read-only files is also unavoidable-error territory.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintln
+        - fmt.Fprintf
+        - (*os.File).Close
+        - (io.Closer).Close
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/rengotaku/codex-run
+
+run:
+  timeout: 5m

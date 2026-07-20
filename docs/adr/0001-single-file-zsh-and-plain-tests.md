@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted (v0.1.0)
+**Superseded by [ADR 0003](0003-go-rewrite-with-boilerplate.md)** — v0.2.0 で Go に全書き換え。
+（履歴として残す。v0.1.0 時点の判断根拠を辿るための資料）
+
+Original: Accepted (v0.1.0)
 
 ## Context
 
