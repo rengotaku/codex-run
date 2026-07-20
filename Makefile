@@ -1,32 +1,66 @@
-SHELL := /bin/zsh
+.PHONY: deps build run lint test test-cov check ci clean install uninstall help
+
+# Default target
+.DEFAULT_GOAL := help
+
+# Variables
+BINARY_NAME := codex-run
+BIN_DIR := bin
+COVERAGE_FILE := coverage.out
 PREFIX ?= $(HOME)/.local
-BIN_DST := $(PREFIX)/bin/codex-run
+INSTALL_DST := $(PREFIX)/bin/$(BINARY_NAME)
+VERSION ?= dev
+LDFLAGS := -s -w -X github.com/rengotaku/codex-run/cmd.Version=$(VERSION)
 
-.PHONY: help lint test ci install uninstall
+## deps: Download dependencies
+deps:
+	go mod download
 
-help:
-	@echo "targets:"
-	@echo "  lint      zsh -n syntax check on bin/codex-run and tests"
-	@echo "  test      run tests/run.zsh (hermetic; no ~/.codex touched)"
-	@echo "  ci        lint + test"
-	@echo "  install   symlink bin/codex-run into \$$PREFIX/bin (default ~/.local/bin)"
-	@echo "  uninstall remove symlink"
+## build: Build the binary into $(BIN_DIR)/$(BINARY_NAME)
+build:
+	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY_NAME) .
 
+## run: Run the CLI (use ARGS="..." to pass arguments)
+run:
+	go run main.go $(ARGS)
+
+## lint: Run golangci-lint
 lint:
-	@zsh -n bin/codex-run
-	@for f in tests/*.zsh; do zsh -n "$$f"; done
-	@echo "lint: OK"
+	golangci-lint run
 
+## test: Run tests
 test:
-	@zsh tests/run.zsh
+	go test ./...
 
-ci: lint test
+## test-cov: Run tests with coverage
+test-cov:
+	go test -coverprofile=$(COVERAGE_FILE) ./...
+	go tool cover -func=$(COVERAGE_FILE)
 
-install:
-	@mkdir -p "$(dir $(BIN_DST))"
-	@ln -sfn "$(CURDIR)/bin/codex-run" "$(BIN_DST)"
-	@echo "installed: $(BIN_DST) -> $(CURDIR)/bin/codex-run"
+## check: Run lint + test
+check: lint test
 
+## ci: Run lint + test with coverage
+ci: lint test-cov
+
+## clean: Remove build artifacts
+clean:
+	rm -rf $(BIN_DIR)/ $(COVERAGE_FILE)
+
+## install: Build and install into $(PREFIX)/bin (default ~/.local/bin)
+install: build
+	@mkdir -p "$(dir $(INSTALL_DST))"
+	@install -m 0755 "$(BIN_DIR)/$(BINARY_NAME)" "$(INSTALL_DST)"
+	@echo "installed: $(INSTALL_DST)"
+
+## uninstall: Remove the installed binary from $(PREFIX)/bin
 uninstall:
-	@rm -f "$(BIN_DST)"
-	@echo "removed: $(BIN_DST)"
+	@rm -f "$(INSTALL_DST)"
+	@echo "removed: $(INSTALL_DST)"
+
+## help: Show this help
+help:
+	@echo "Usage: make [target]"
+	@echo ""
+	@echo "Targets:"
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/## /  /'
