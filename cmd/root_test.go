@@ -29,7 +29,42 @@ func isolateEnv(t *testing.T, codexBin, sessionsDir, stateHome string) {
 	t.Setenv("CODEX_TIMEOUT", "")
 	t.Setenv("CODEX_SESSIONS_DIR", sessionsDir)
 	t.Setenv("XDG_STATE_HOME", stateHome)
+	t.Setenv("CODEX_FAIL_SCAN_TAIL_LINES", "")
 }
+
+// echoedInputWith429Script is a fake `codex` binary that echoes ~26 lines of
+// output: three early lines contain "429" (mimicking an agent echoing input
+// data), followed by 20 harmless lines and 3 trailing success-marker lines.
+// It mirrors internal/runner's echoedInputWith429Lines fixture (issue #17).
+const echoedInputWith429Script = `#!/bin/sh
+echo 'input echo: request id 429 accepted'
+echo 'input echo: batch contains 429 total records'
+echo 'input echo: row 429 processed'
+echo 'processing item 1'
+echo 'processing item 2'
+echo 'processing item 3'
+echo 'processing item 4'
+echo 'processing item 5'
+echo 'processing item 6'
+echo 'processing item 7'
+echo 'processing item 8'
+echo 'processing item 9'
+echo 'processing item 10'
+echo 'processing item 11'
+echo 'processing item 12'
+echo 'processing item 13'
+echo 'processing item 14'
+echo 'processing item 15'
+echo 'processing item 16'
+echo 'processing item 17'
+echo 'processing item 18'
+echo 'processing item 19'
+echo 'processing item 20'
+echo 'tokens used'
+echo '65,699'
+echo 'DONE 40'
+exit 0
+`
 
 func TestRun_help(t *testing.T) {
 	isolateEnv(t, "codex", t.TempDir(), t.TempDir())
@@ -149,6 +184,79 @@ exit 0
 	content, err := os.ReadFile(outPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(content), "content")
+}
+
+// C1: CODEX_FAIL_SCAN_TAIL_LINES is actually wired through to runner.Config.
+func TestRun_failScanTailLinesEnvWired(t *testing.T) {
+	fake := writeFakeCodex(t, echoedInputWith429Script)
+	sess := t.TempDir()
+	state := t.TempDir()
+	isolateEnv(t, fake, sess, state)
+	t.Setenv("CODEX_FAIL_SCAN_TAIL_LINES", "3")
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(),
+		[]string{"--models", "only", "--timeout", "5", "hi"},
+		&stdout, &stderr)
+	assert.Equal(t, 0, code)
+	out := strings.TrimSpace(stdout.String())
+	require.NotEmpty(t, out)
+	assert.NotContains(t, stderr.String(), "FAIL")
+}
+
+// C2: with the env var unset, the positive default (not 0/full-scan) is
+// used. If the implementation ever regresses to defaulting to 0, this test
+// fails because the early-echoed "429" would then be caught by a full scan.
+func TestRun_failScanTailLinesDefaultIsPositive(t *testing.T) {
+	fake := writeFakeCodex(t, echoedInputWith429Script)
+	sess := t.TempDir()
+	state := t.TempDir()
+	isolateEnv(t, fake, sess, state) // CODEX_FAIL_SCAN_TAIL_LINES reset to "" (unset)
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(),
+		[]string{"--models", "only", "--timeout", "5", "hi"},
+		&stdout, &stderr)
+	assert.Equal(t, 0, code)
+	out := strings.TrimSpace(stdout.String())
+	require.NotEmpty(t, out)
+	assert.NotContains(t, stderr.String(), "FAIL")
+}
+
+// C3: CODEX_FAIL_SCAN_TAIL_LINES=0 falls back to a full-file scan even when
+// wired through env (not just via runner.Config directly).
+func TestRun_failScanTailLinesZeroEnvFullScan(t *testing.T) {
+	script := `#!/bin/sh
+model=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m) model="$2"; shift 2 ;;
+    *)  shift ;;
+  esac
+done
+case "$model" in
+  bad)
+` + strings.TrimPrefix(echoedInputWith429Script, "#!/bin/sh\n") + `    ;;
+  good)
+    echo 'OK from good'
+    exit 0
+    ;;
+esac
+`
+	fake := writeFakeCodex(t, script)
+	sess := t.TempDir()
+	state := t.TempDir()
+	isolateEnv(t, fake, sess, state)
+	t.Setenv("CODEX_FAIL_SCAN_TAIL_LINES", "0")
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(),
+		[]string{"--models", "bad,good", "--timeout", "5", "hi"},
+		&stdout, &stderr)
+	assert.Equal(t, 0, code)
+	assert.Contains(t, stderr.String(), "bad: FAIL")
+	assert.Contains(t, stderr.String(), "fail-pattern in output (exit=0)")
+	assert.Contains(t, stderr.String(), "good: OK")
 }
 
 func TestRun_capacityFallsThroughViaEnv(t *testing.T) {

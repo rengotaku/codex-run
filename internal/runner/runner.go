@@ -43,6 +43,13 @@ type Config struct {
 	Stderr      io.Writer // progress log
 	NowUnix     func() int64
 	Reporter    UsageReporter // optional
+
+	// FailScanTailLines limits fail-pattern scanning to the trace file's
+	// last N lines, so input data echoed by the agent (which tends to
+	// appear earlier in the trace) doesn't trigger false-positive retries.
+	// 0 or less ⇒ scan the entire file (opt-out safety valve; matches the
+	// pre-#17 behavior for callers that want the full-file guarantee back).
+	FailScanTailLines int
 }
 
 // Run executes the fallback loop and returns the process exit code.
@@ -89,7 +96,7 @@ func Run(ctx context.Context, cfg Config) int {
 		reason := ""
 		switch {
 		case ec == 0:
-			if fileMatchesFailPattern(outPath) {
+			if fileMatchesFailPattern(outPath, cfg.FailScanTailLines) {
 				reason = "fail-pattern in output (exit=0)"
 			} else {
 				success = true
@@ -99,7 +106,7 @@ func Run(ctx context.Context, cfg Config) int {
 			}
 		case ec == TimeoutExitCode:
 			reason = fmt.Sprintf("timeout after %ds", cfg.TimeoutSec)
-		case fileMatchesFailPattern(outPath):
+		case fileMatchesFailPattern(outPath, cfg.FailScanTailLines):
 			reason = fmt.Sprintf("fail-pattern (exit=%d)", ec)
 		default:
 			reason = fmt.Sprintf("exit=%d", ec)
@@ -223,10 +230,41 @@ func sanitizeModel(m string) string {
 	return b.String()
 }
 
-func fileMatchesFailPattern(path string) bool {
+// fileMatchesFailPattern reports whether the trace file at path contains a
+// retryable failure signature. When tailLines is positive, only the file's
+// last tailLines lines are scanned (see Config.FailScanTailLines); 0 or
+// less scans the entire file.
+func fileMatchesFailPattern(path string, tailLines int) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
+	if tailLines > 0 {
+		data = lastNLines(data, tailLines)
+	}
 	return failPatterns.Match(data)
+}
+
+// lastNLines returns the last n lines of data, splitting on '\n'. A
+// preserved trailing newline in the input is preserved in the output.
+// n <= 0, or n at-or-above the total number of lines, returns data
+// unchanged (no copy).
+func lastNLines(data []byte, n int) []byte {
+	if n <= 0 {
+		return data
+	}
+	trailingNewline := len(data) > 0 && data[len(data)-1] == '\n'
+	body := data
+	if trailingNewline {
+		body = data[:len(data)-1]
+	}
+	lines := strings.Split(string(body), "\n")
+	if n >= len(lines) {
+		return data
+	}
+	tail := strings.Join(lines[len(lines)-n:], "\n")
+	if trailingNewline {
+		tail += "\n"
+	}
+	return []byte(tail)
 }
