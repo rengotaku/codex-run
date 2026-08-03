@@ -88,6 +88,7 @@ out=$(codex-run "設計レビュー: $(cat design.md)") && less "$out"
 | `CODEX_BIN` | `codex` バイナリのパス（既定 `codex`。テスト用） |
 | `CODEX_SESSIONS_DIR` | rollout jsonl の探索ルート（既定 `~/.codex/sessions`） |
 | `XDG_STATE_HOME` | `usage.log` の格納先（既定 `~/.local/state`。実ファイルは `<XDG_STATE_HOME>/codex-run/usage.log`） |
+| `CODEX_FAIL_SCAN_TAIL_LINES` | fail-pattern 走査を trace 末尾何行に絞るか（既定 20。0 以下でファイル全体走査に戻す） |
 
 ## usage.log の形式
 

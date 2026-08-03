@@ -34,6 +34,12 @@ const DefaultModels = "gpt-5.6-sol,gpt-5.6-luna,gpt-5.6-terra,gpt-5.5"
 // DefaultTimeoutSec is the per-model wall-clock cap.
 const DefaultTimeoutSec = 600
 
+// DefaultFailScanTailLines is how many trailing lines of a trace file are
+// scanned for retryable fail-patterns by default. See
+// runner.Config.FailScanTailLines for the full-scan (0/negative) escape
+// hatch.
+const DefaultFailScanTailLines = 20
+
 const usageText = `codex-run — fallback wrapper around ` + "`codex exec`" + `
 
 Usage:
@@ -127,15 +133,16 @@ func run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 
 	return runner.Run(ctx, runner.Config{
-		Models:      parsed.Models,
-		Passthrough: parsed.Passthrough,
-		Prompt:      parsed.Prompt,
-		OutFile:     parsed.OutFile,
-		TimeoutSec:  parsed.TimeoutSec,
-		CodexBin:    codexBin,
-		Stdout:      stdout,
-		Stderr:      stderr,
-		Reporter:    reporter,
+		Models:            parsed.Models,
+		Passthrough:       parsed.Passthrough,
+		Prompt:            parsed.Prompt,
+		OutFile:           parsed.OutFile,
+		TimeoutSec:        parsed.TimeoutSec,
+		CodexBin:          codexBin,
+		Stdout:            stdout,
+		Stderr:            stderr,
+		Reporter:          reporter,
+		FailScanTailLines: envIntAllowNonPositiveOr("CODEX_FAIL_SCAN_TAIL_LINES", DefaultFailScanTailLines),
 	})
 }
 
@@ -157,6 +164,23 @@ func envIntOr(key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+// envIntAllowNonPositiveOr is like envIntOr but does NOT treat 0 or negative
+// values as invalid: only an unset/empty env var or a non-numeric value
+// falls back to def. This is required for CODEX_FAIL_SCAN_TAIL_LINES, where
+// 0 (and negative values) are a meaningful, intentional "full scan" setting
+// rather than an error condition.
+func envIntAllowNonPositiveOr(key string, def int) int {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
 		return def
 	}
 	return n

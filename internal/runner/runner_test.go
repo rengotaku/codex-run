@@ -67,6 +67,41 @@ func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+// writeFakeCodexScript writes an arbitrary POSIX sh script verbatim as a fake
+// `codex` binary. Unlike makeFakeCodex (which enumerates fixed modes per
+// model), this lets tests control exact line counts and the position of
+// fail-pattern text within the output, which the tail-scan tests need.
+func writeFakeCodexScript(t *testing.T, script string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codex uses POSIX sh; not supported on windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex")
+	require.NoError(t, os.WriteFile(path, []byte(script), 0o755))
+	return path
+}
+
+// echoedInputWith429Script returns a fake-codex script body (case-branch
+// content, no shebang/case wrapper) that mimics an agent echoing input data
+// containing "429" early, followed by harmless lines and a trailing success
+// marker. Used by R1 and R4 (and their cmd-level analogues C1-C3) to
+// reproduce the issue #17 false-positive scenario.
+func echoedInputWith429Lines() string {
+	var b strings.Builder
+	b.WriteString("    echo 'input echo: request id 429 accepted'\n")
+	b.WriteString("    echo 'input echo: batch contains 429 total records'\n")
+	b.WriteString("    echo 'input echo: row 429 processed'\n")
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&b, "    echo 'processing item %d'\n", i)
+	}
+	b.WriteString("    echo 'tokens used'\n")
+	b.WriteString("    echo '65,699'\n")
+	b.WriteString("    echo 'DONE 40'\n")
+	b.WriteString("    exit 0\n")
+	return b.String()
+}
+
 func TestRun_successOnFirstAttempt(t *testing.T) {
 	bin := makeFakeCodex(t, map[string]string{"good": "OK"})
 	var stdout, stderr bytes.Buffer
@@ -268,4 +303,197 @@ func TestSanitizeModel(t *testing.T) {
 	assert.Equal(t, "abc_def", sanitizeModel("abc/def"))
 	assert.Equal(t, "a_b_c", sanitizeModel("a b c"))
 	assert.Equal(t, "___", sanitizeModel("///"))
+}
+
+// --- issue #17: fail-pattern tail-scan tests (R1-R5) ---
+
+// R1: early input-echo containing "429" must be ignored when it falls
+// outside the tail-scan window; the run should succeed.
+func TestRun_tailScan_ignoresEarlyInputEcho429(t *testing.T) {
+	script := "#!/bin/sh\n" + echoedInputWith429Lines()
+	bin := writeFakeCodexScript(t, script)
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), Config{
+		Models:            []string{"only"},
+		Prompt:            "hi",
+		TimeoutSec:        5,
+		CodexBin:          bin,
+		FailScanTailLines: 5,
+		Stdout:            &stdout,
+		Stderr:            &stderr,
+	})
+	assert.Equal(t, 0, code)
+	out := strings.TrimSpace(stdout.String())
+	require.NotEmpty(t, out)
+	assert.NotContains(t, stderr.String(), "FAIL")
+}
+
+// R2: a genuine fail-pattern that falls inside the tail-scan window must
+// still be detected (no regression from narrowing the scan range).
+func TestRun_tailScan_detectsFailPatternInsideWindow(t *testing.T) {
+	script := `#!/bin/sh
+model=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m) model="$2"; shift 2 ;;
+    *)  shift ;;
+  esac
+done
+case "$model" in
+  bad)
+    echo 'line1'
+    echo 'line2'
+    echo 'line3'
+    echo 'line4'
+    echo 'line5'
+    echo 'line6'
+    echo 'line7'
+    echo 'line8'
+    echo 'Selected model is at capacity'
+    exit 0
+    ;;
+  good)
+    echo 'OK from good'
+    exit 0
+    ;;
+esac
+`
+	bin := writeFakeCodexScript(t, script)
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), Config{
+		Models:            []string{"bad", "good"},
+		Prompt:            "hi",
+		TimeoutSec:        5,
+		CodexBin:          bin,
+		FailScanTailLines: 5,
+		Stdout:            &stdout,
+		Stderr:            &stderr,
+	})
+	assert.Equal(t, 0, code)
+	assert.Contains(t, stderr.String(), "bad: FAIL")
+	assert.Contains(t, stderr.String(), "fail-pattern in output (exit=0)")
+	assert.Contains(t, stderr.String(), "good: OK")
+}
+
+// R3: a fail-pattern that falls outside the tail-scan window is
+// intentionally missed (documents the known trade-off of scanning only the
+// tail; future changes must not silently alter this behavior).
+func TestRun_tailScan_missesFailPatternOutsideWindow(t *testing.T) {
+	script := `#!/bin/sh
+echo 'row 429 processed early'
+echo 'harmless 1'
+echo 'harmless 2'
+echo 'harmless 3'
+echo 'harmless 4'
+echo 'harmless 5'
+echo 'harmless 6'
+echo 'harmless 7'
+echo 'harmless 8'
+echo 'harmless 9'
+echo 'harmless 10'
+echo 'harmless 11'
+exit 0
+`
+	bin := writeFakeCodexScript(t, script)
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), Config{
+		Models:            []string{"only"},
+		Prompt:            "hi",
+		TimeoutSec:        5,
+		CodexBin:          bin,
+		FailScanTailLines: 3,
+		Stdout:            &stdout,
+		Stderr:            &stderr,
+	})
+	assert.Equal(t, 0, code)
+	assert.NotContains(t, stderr.String(), "FAIL")
+}
+
+// R4: FailScanTailLines <= 0 is the full-scan escape hatch; it must still
+// detect a fail-pattern that a positive tail window would have missed.
+func TestRun_tailScan_zeroFallsBackToFullScan(t *testing.T) {
+	script := "#!/bin/sh\n" +
+		"model=''\n" +
+		"while [ $# -gt 0 ]; do\n" +
+		"  case \"$1\" in\n" +
+		"    -m) model=\"$2\"; shift 2 ;;\n" +
+		"    *)  shift ;;\n" +
+		"  esac\n" +
+		"done\n" +
+		"case \"$model\" in\n" +
+		"  bad)\n" + echoedInputWith429Lines() + "    ;;\n" +
+		"  good)\n" +
+		"    echo 'OK from good'\n" +
+		"    exit 0\n" +
+		"    ;;\n" +
+		"esac\n"
+	bin := writeFakeCodexScript(t, script)
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), Config{
+		Models:            []string{"bad", "good"},
+		Prompt:            "hi",
+		TimeoutSec:        5,
+		CodexBin:          bin,
+		FailScanTailLines: 0,
+		Stdout:            &stdout,
+		Stderr:            &stderr,
+	})
+	assert.Equal(t, 0, code)
+	assert.Contains(t, stderr.String(), "bad: FAIL")
+	assert.Contains(t, stderr.String(), "fail-pattern in output (exit=0)")
+	assert.Contains(t, stderr.String(), "good: OK")
+}
+
+// R5: lastNLines boundary conditions, isolated from the Run() integration
+// path so off-by-one / trailing-newline mistakes are caught locally.
+func TestLastNLines(t *testing.T) {
+	cases := []struct {
+		name string
+		data []byte
+		n    int
+		want []byte
+	}{
+		{
+			name: "n<=0 returns input unchanged",
+			data: []byte("a\nb\nc\n"),
+			n:    0,
+			want: []byte("a\nb\nc\n"),
+		},
+		{
+			name: "negative n returns input unchanged",
+			data: []byte("a\nb\nc\n"),
+			n:    -3,
+			want: []byte("a\nb\nc\n"),
+		},
+		{
+			name: "n exceeds total line count returns input unchanged (trailing newline)",
+			data: []byte("a\nb\nc\n"),
+			n:    10,
+			want: []byte("a\nb\nc\n"),
+		},
+		{
+			name: "n exceeds total line count returns input unchanged (no trailing newline)",
+			data: []byte("a\nb\nc"),
+			n:    10,
+			want: []byte("a\nb\nc"),
+		},
+		{
+			name: "5 lines, n=2, trailing newline preserved without duplication",
+			data: []byte("l1\nl2\nl3\nl4\nl5\n"),
+			n:    2,
+			want: []byte("l4\nl5\n"),
+		},
+		{
+			name: "5 lines, n=2, no trailing newline, no line dropped",
+			data: []byte("l1\nl2\nl3\nl4\nl5"),
+			n:    2,
+			want: []byte("l4\nl5"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := lastNLines(tc.data, tc.n)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }
